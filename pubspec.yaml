@@ -1,0 +1,48 @@
+name: xorbit
+description: Fast. Local. Private. File transfer for everyone.
+display_name: Xorbit
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP server embedded in app
+  shelf: ^1.4.1
+  shelf_router: ^1.1.4
+  shelf_multipart: ^1.0.0
+
+  # Networking
+  dio: ^5.4.0
+
+  # File handling
+  file_picker: ^8.0.3
+
+  # Storage
+  shared_preferences: ^2.2.2
+
+  # Utils
+  uuid: ^4.3.3
+  mime: ^1.0.4
+  path: ^1.9.0
+  path_provider: ^2.1.2
+  open_filex: ^4.3.4  # open received files from within the app
+
+dev_dependencies:
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  windows:
+    generate: true
+    image_path: "assets/icon/icon.png"
+    icon_size: 48
+  image_path: "assets/icon/icon.png"
+  min_sdk_android: 21
+
+flutter:
+  uses-material-design: true
