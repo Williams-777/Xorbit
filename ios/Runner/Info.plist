@@ -27,6 +27,32 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>
+	<key>NSLocalNetworkUsageDescription</key>
+<string>Xorbit needs local network access to discover nearby devices and transfer files.</string>
+
+<key>NSBonjourServices</key>
+<array>
+    <string>_xorbit._tcp</string>
+    <string>_xorbit._udp</string>
+</array>
+
+<key>CFBundleDocumentTypes</key>
+<array>
+    <dict>
+        <key>CFBundleTypeName</key>
+        <string>All Files</string>
+        <key>LSHandlerRank</key>
+        <string>Alternate</string>
+        <key>LSItemContentTypes</key>
+        <array>
+            <string>public.data</string>
+            <string>public.image</string>
+            <string>public.movie</string>
+            <string>public.audio</string>
+            <string>public.text</string>
+        </array>
+    </dict>
+</array>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>

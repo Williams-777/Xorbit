@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Network permissions — required for WiFi/hotspot transfer -->
     <uses-permission android:name="android.permission.INTERNET"/>
@@ -6,7 +7,7 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
 
-    <!-- mDNS requires multicast -->
+    <!-- UDP broadcast discovery -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
 
     <!-- File access -->
@@ -22,9 +23,16 @@
     <!-- Clipboard -->
     <uses-permission android:name="android.permission.READ_CLIPBOARD"/>
 
+    <!-- Full storage access for saving to main Xorbit folder -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage"/>
+
     <!-- Keep server alive in background -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:label="Xorbit"
@@ -75,15 +83,10 @@
 
         </activity>
 
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths"/>
-        </provider>
+        <service
+        android:name="com.pravera.flutter_foreground_task.service.ForegroundTaskService"
+        android:foregroundServiceType="dataSync"
+        android:exported="false" />
 
         <!-- Flutter embedding -->
         <meta-data

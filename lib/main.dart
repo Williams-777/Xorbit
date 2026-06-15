@@ -1,20 +1,20 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:open_filex/open_filex.dart';
+import 'dart:math' as math;
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
 import 'models/app_state.dart';
 import 'models/transfer_item.dart';
 import 'server/embedded_server.dart';
 import 'server/discovery.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 // ─────────────────────────────────────────────────────
 //  GLOBALS
@@ -168,7 +168,6 @@ class _DevicePageState extends State<DevicePage> {
   bool _incomingSheetShowing = false;
 
   Timer? _uiRefreshTimer;
-  Timer? _pendingFilesTimer;
 
   @override
   void initState() {
@@ -177,11 +176,29 @@ class _DevicePageState extends State<DevicePage> {
     appState.addListener(_onStateChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) => _init());
   }
+  Future<String> _getLocalIp() async {
+  if (_discovery.myIp != null && _discovery.myIp!.isNotEmpty) {
+    return _discovery.myIp!;
+  }
+  try {
+    for (final iface in await NetworkInterface.list(
+        type: InternetAddressType.IPv4, includeLoopback: false)) {
+      for (final addr in iface.addresses) {
+        final ip = addr.address;
+        if (ip.startsWith('192.168.') ||
+            ip.startsWith('10.')      ||
+            ip.startsWith('172.')) {
+          return ip;
+        }
+      }
+    }
+  } catch (_) {}
+  return '127.0.0.1';
+}
 
   @override
   void dispose() {
     _uiRefreshTimer?.cancel();
-    _pendingFilesTimer?.cancel();
     appState.removeListener(_onStateChanged);
     _nameCtrl.dispose();
     _server.stop();
@@ -193,15 +210,24 @@ class _DevicePageState extends State<DevicePage> {
     if (!mounted) return;
     setState(() {});
 
+    // If we just connected and had pending shared files, send them now
+    if (appState.isConnected && appState.pendingSharedPaths.isNotEmpty) {
+      final paths = List<String>.from(appState.pendingSharedPaths);
+      appState.pendingSharedPaths.clear();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _sendSharedFiles(paths);
+      });
+    }
+
     // Check for incoming connection request
     if (appState.pendingRequests.containsKey(appState.myId) &&
         !_connDialogShowing) {
       final fromId   = appState.pendingRequests[appState.myId]!;
-      final fromName = appState.pendingFromName ?? 
+      final fromName = appState.pendingFromName ??
                        appState.nearbyDevices[fromId]?.name ?? 'Unknown';
-      final fromIp   = appState.pendingFromIp   ?? 
+      final fromIp   = appState.pendingFromIp   ??
                        appState.nearbyDevices[fromId]?.ip   ?? '';
-      final fromPort = appState.pendingFromPort ?? 
+      final fromPort = appState.pendingFromPort ??
                        appState.nearbyDevices[fromId]?.port ?? kServerPort;
 
       // Clear immediately so _onStateChanged doesn't fire again
@@ -269,6 +295,9 @@ class _DevicePageState extends State<DevicePage> {
   // ── INIT ───────────────────────────────────────────
 
   Future<void> _init() async {
+    // Handle files/text shared to Xorbit from other apps
+    _handleSharedIntent();
+
     // If name not set, prompt first
     if (appState.myName.isEmpty) {
       final name = await _promptDeviceName();
@@ -313,11 +342,59 @@ class _DevicePageState extends State<DevicePage> {
     // UI is ready regardless of whether server/mDNS succeeded
     if (mounted) setState(() => _starting = false);
 
+    await _checkSharedContent();
+
     // Refresh UI periodically for device list updates
     _uiRefreshTimer = Timer.periodic(
       const Duration(seconds: 3), (_) {
         if (mounted) setState(() {});
       });
+  }
+
+  // ── SHARED CONTENT ─────────────────────────────────
+
+  Future<void> _checkSharedContent() async {
+    if (!Platform.isAndroid && !Platform.isIOS) return;
+
+    try {
+      const channel = MethodChannel('com.williams.xorbit/share');
+
+      final shared = await channel.invokeMethod<Map>('getSharedContent');
+
+      if (shared == null) return;
+
+      final text  = shared['text'] as String?;
+      final files = shared['files'] as List?;
+
+      if (text != null && text.isNotEmpty && appState.isConnected) {
+        await Dio().post(
+          '${appState.peerBaseUrl}/clipboard',
+          data: {'text': text},
+        );
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('📋 Shared text sent to connected device'),
+            ),
+          );
+        }
+      }
+
+      if (files != null && files.isNotEmpty) {
+        if (mounted && appState.isConnected) {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => TransferPage(
+                targetName:  appState.connectedToName ?? 'Unknown',
+                sharedPaths: List<String>.from(files),
+              ),
+            ),
+          );
+        }
+      }
+    } catch (_) {}
   }
 
   // ── DEVICE NAME ────────────────────────────────────
@@ -350,6 +427,57 @@ class _DevicePageState extends State<DevicePage> {
     setState(() => _editingName = false);
   }
 
+  // ── SHARE SHEET HANDLER ─────────────────────────────
+  // Handles files and text shared to Xorbit from other apps.
+  // Called on init — reads any data passed via the share intent.
+
+  void _handleSharedIntent() async {
+    try {
+      const channel = MethodChannel('com.williams.xorbit/share');
+      final data = await channel.invokeMethod<Map>('getSharedData');
+      if (data == null) return;
+
+      if (data['type'] == 'text') {
+        final text = data['text'] as String? ?? '';
+        if (text.isNotEmpty && mounted) {
+          await Clipboard.setData(ClipboardData(text: text));
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('Shared text ready to sync'),
+            action: SnackBarAction(label: 'Sync now', onPressed: _syncClipboard),
+          ));
+        }
+      } else if (data['type'] == 'files') {
+        final paths = List<String>.from(data['paths'] ?? []);
+        if (paths.isNotEmpty) {
+          if (!appState.isConnected) {
+            appState.pendingSharedPaths = paths;
+            if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Files ready — connect to a device to send them'),
+                duration: Duration(seconds: 5)));
+          } else {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) _sendSharedFiles(paths);
+            });
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Share handler: $e');
+      // Non-fatal — normal app launch, no shared data
+    }
+  }
+
+  void _sendSharedFiles(List<String> paths) {
+    if (!appState.isConnected) return;
+    Navigator.push(context, MaterialPageRoute(
+      builder: (_) => TransferPage(
+        targetName:  appState.connectedToName ?? 'Unknown',
+        sharedPaths: paths,
+      ),
+    ));
+  }
+
   // ── CONNECTION ─────────────────────────────────────
 
   Future<void> _sendConnectRequest(XorbitDevice target) async {
@@ -360,7 +488,7 @@ class _DevicePageState extends State<DevicePage> {
         data: {
           'fromId':   appState.myId,
           'fromName': appState.myName,
-          'fromIp':   _discovery.myIp ?? '',
+          'fromIp':   await _getLocalIp(),
           'fromPort': appState.myPort,
         },
         options: Options(
@@ -399,7 +527,7 @@ class _DevicePageState extends State<DevicePage> {
               appState.pendingRequests.remove(appState.myId);
               try {
                 final dio = Dio();
-                // Notify the SENDER (fromIp) that we declined — 
+                // Notify the SENDER (fromIp) that we declined —
                 // this triggers a snackbar on their device
                 await dio.post(
                   'http://$fromIp:$fromPort/notify-declined',
@@ -440,7 +568,7 @@ class _DevicePageState extends State<DevicePage> {
         data: {
           'peerId':   appState.myId,
           'peerName': appState.myName,
-          'peerIp':   _discovery.myIp ?? '',
+          'peerIp':   await _getLocalIp(),
           'peerPort': appState.myPort,
         },
       );
@@ -571,14 +699,13 @@ class _DevicePageState extends State<DevicePage> {
       ),
 
       body: _starting
-          ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-              const CircularProgressIndicator(),
-              const SizedBox(height: 16),
-              Text('Starting Xorbit...',
-                style: TextStyle(
-                  color: scheme.onSurface.withOpacity(0.5))),
-            ]))
-          : Column(children: [
+          ? const OrbitalLoadingScreen()
+          : Stack(children: [
+
+              // ── ORBITAL BACKGROUND ANIMATION ──────────
+              const Positioned.fill(child: OrbitalBackground()),
+
+              Positioned.fill(child: Column(children: [
 
               // ── MY DEVICE CARD ──────────────────────
               Padding(
@@ -637,12 +764,13 @@ class _DevicePageState extends State<DevicePage> {
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(18)),
                       ),
-                      onPressed: () => Navigator.push(context,
-                        MaterialPageRoute(
+                      onPressed: () {
+                        Navigator.push(context, MaterialPageRoute(
                           builder: (_) => TransferPage(
                             targetName: appState.connectedToName ?? 'Unknown',
                           ),
-                        )),
+                        ));
+                      },
                     ),
                   ),
                 ),
@@ -741,7 +869,8 @@ class _DevicePageState extends State<DevicePage> {
                   },
                 ),
               ),
-            ]),
+            ])),  // end Column + Positioned.fill
+          ]),     // end Stack
     );
   }
 
@@ -1054,26 +1183,98 @@ class _DevicePageState extends State<DevicePage> {
     );
   }
 }
+// ─────────────────────────────────────────────────────
+//  SHARED FILE WRAPPER
+//  Wraps a plain file path to look like a PlatformFile
+//  so the upload queue can handle share-sheet files.
+// ─────────────────────────────────────────────────────
+class _SharedFile {
+  final String path;
+  final String name;
+  final int size;
+  Stream<List<int>>? get readStream => File(path).openRead();
+  _SharedFile({required this.path, required this.name, required this.size});
+}
 
 // ═══════════════════════════════════════════════════════
 //  TRANSFER PAGE
 // ═══════════════════════════════════════════════════════
 class TransferPage extends StatefulWidget {
   final String targetName;
-  const TransferPage({super.key, required this.targetName});
+  final List<String> sharedPaths; // files shared from other apps
+  const TransferPage({
+    super.key,
+    required this.targetName,
+    this.sharedPaths = const [],
+  });
   @override
   State<TransferPage> createState() => _TransferPageState();
 }
 
 class _TransferPageState extends State<TransferPage> {
-  final Dio dio = Dio(BaseOptions(
+  final dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 15),
-    receiveTimeout: Duration.zero, // no timeout — large chunks take time
-    sendTimeout:    Duration.zero, // no timeout on sending
+    receiveTimeout: Duration.zero,
+    sendTimeout:    Duration.zero,
   ));
 
   bool   _isRunning = false;
-  String _filter    = 'all'; // all / sending / receiving
+  String _filter    = 'all';
+
+  @override
+  void initState() {
+    super.initState();
+    // If opened via share sheet, queue shared files immediately
+    if (widget.sharedPaths.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _queueSharedPaths(widget.sharedPaths);
+      });
+    }
+  }
+
+
+// Call this before _runQueue()
+Future<void> _startForegroundService() async {
+  if (!Platform.isAndroid) return;
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'xorbit_transfer',
+      channelName: 'Xorbit Transfer',
+      channelDescription: 'Keeps file transfers running in the background',
+      channelImportance: NotificationChannelImportance.LOW,
+      priority: NotificationPriority.LOW,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+      autoRunOnBoot: false,
+    ),
+  );
+
+  await FlutterForegroundTask.startService(
+    notificationTitle: 'Xorbit',
+    notificationText: 'Transfer in progress...',
+  );
+}
+
+Future<void> _stopForegroundService() async {
+  if (!Platform.isAndroid) return;
+  await FlutterForegroundTask.stopService();
+}
+
+  Future<void> _queueSharedPaths(List<String> paths) async {
+    for (final path in paths) {
+      final file = File(path);
+      if (!file.existsSync()) continue;
+      final name = p.basename(path);
+      final size = file.lengthSync();
+      // Create a minimal PlatformFile-compatible wrapper
+      final pf = _SharedFile(path: path, name: name, size: size);
+      final item = TransferItem.sending(transferId: const Uuid().v4(), file: pf);
+      appState.addTransfer(item);
+    }
+    _runQueue();
+  }
 
   List<TransferItem> get _filtered {
     switch (_filter) {
@@ -1108,18 +1309,47 @@ class _TransferPageState extends State<TransferPage> {
       appState.addTransfer(item);
     }
 
-    if (!_isRunning) _runQueue();
+    await _startForegroundService();
+    // Always call _runQueue — it checks _isRunning internally
+    // so duplicate calls are safe. This ensures newly added items
+    // start immediately even if the queue was idle.
+    _runQueue();
   }
 
   Future<void> _runQueue() async {
+    // If already running, the while loop below will naturally pick up
+    // any newly added items — no need to start a second loop.
+    if (_isRunning) return;
     _isRunning = true;
-    for (final item in appState.transfers) {
-      if (item.direction != TransferDirection.sending) continue;
-      if (item.status == TransferStatus.cancelled) continue;
-      if (item.status == TransferStatus.done) continue;
-      await _uploadFile(item);
+
+    try {
+      while (true) {
+        // Always re-query the list — items may have been added since last loop
+        final next = appState.transfers.where((t) =>
+          t.direction == TransferDirection.sending &&
+          t.status    == TransferStatus.waiting).firstOrNull;
+
+        if (next == null) {
+          // No waiting items — wait a bit longer before giving up.
+          // This handles the case where addTransfer() was called
+          // in the same async frame and hasn't propagated yet.
+          await Future.delayed(const Duration(milliseconds: 300));
+          final recheck = appState.transfers.where((t) =>
+            t.direction == TransferDirection.sending &&
+            t.status    == TransferStatus.waiting).firstOrNull;
+          if (recheck == null) break; // truly nothing left
+          await _uploadFile(recheck);
+        } else {
+          await _uploadFile(next);
+        }
+
+        // Brief pause between files — lets receiver flush previous write
+        await Future.delayed(const Duration(milliseconds: 150));
+      }
+    } finally {
+      _isRunning = false;
+      await _stopForegroundService(); 
     }
-    _isRunning = false;
   }
 
   // ── CHUNKED UPLOAD ─────────────────────────────────
@@ -1136,9 +1366,28 @@ class _TransferPageState extends State<TransferPage> {
     appState.updateTransfer(item.transferId,
       status: TransferStatus.transferring);
 
-    final totalSize   = item.file.size;
+      
+
+    // Extract file properties safely from dynamic — works for both
+    // PlatformFile (from file_picker) and _SharedFile (from share sheet)
+    if (item.file == null) {
+      appState.updateTransfer(item.transferId, status: TransferStatus.failed);
+      return;
+    }
+    final dynamic fileObj  = item.file;
+    final int     totalSize   = fileObj.size as int;
+    final String  fileName    = fileObj.name as String;
+    final String? filePath    = fileObj.path as String?;
     final totalChunks = (totalSize / kChunkSize).ceil();
-    final hasPath     = item.file.path != null;
+    final hasPath     = filePath != null;
+
+
+    if (Platform.isAndroid) {
+       FlutterForegroundTask.updateService(
+        notificationTitle: 'Sending ${fileName}',
+        notificationText: '${(item.currentChunk / totalChunks * 100).toStringAsFixed(0)}%',
+      );
+    }
 
     int sentBytes      = item.currentChunk * kChunkSize;
     int lastSpeedBytes = sentBytes;
@@ -1148,33 +1397,36 @@ class _TransferPageState extends State<TransferPage> {
     List<Uint8List> streamChunks = [];
 
     if (hasPath) {
-      try { raf = await File(item.file.path!).open(); }
-      catch (_) {
-        appState.updateTransfer(item.transferId,
-          status: TransferStatus.failed);
+      // Path available — open file once, read chunks on demand (most efficient)
+      try { raf = await File(filePath).open(); }
+      catch (e) {
+        debugPrint('Cannot open file: $e');
+        appState.updateTransfer(item.transferId, status: TransferStatus.failed);
         return;
       }
     } else {
-      // For stream-based files (Android media store), buffer chunk by chunk
-      // rather than loading the entire file into memory at once.
-      // We collect into streamChunks lazily during the upload loop below.
+      // No path (Android content URI) — copy to temp file first so we can
+      // seek through it chunk by chunk without loading it all into RAM.
       try {
-        final all = <int>[];
-        await for (final chunk in item.file.readStream!) {
-          all.addAll(chunk);
-          // Free memory as we go by chunking immediately
-          if (all.length >= kChunkSize) {
-            streamChunks.add(Uint8List.fromList(all.sublist(0, kChunkSize)));
-            all.removeRange(0, kChunkSize);
-          }
+        final stream = fileObj.readStream as Stream<List<int>>?;
+        if (stream == null) {
+          appState.updateTransfer(item.transferId, status: TransferStatus.failed);
+          return;
         }
-        // Remaining bytes
-        if (all.isNotEmpty) {
-          streamChunks.add(Uint8List.fromList(all));
-        }
-      } catch (_) {
-        appState.updateTransfer(item.transferId,
-          status: TransferStatus.failed);
+        // Write stream to temp file
+        final tmpDir  = Directory.systemTemp;
+        final tmpFile = File('${tmpDir.path}/xorbit_tmp_${item.transferId}');
+        final sink    = tmpFile.openWrite();
+        await for (final chunk in stream) { sink.add(chunk); }
+        await sink.flush();
+        await sink.close();
+        // Now open as RandomAccessFile for chunk reading
+        raf = await tmpFile.open();
+        // Clean up temp file after transfer (handled in finally block)
+        item.tempPath = tmpFile.path;
+      } catch (e) {
+        debugPrint('Stream copy error: $e');
+        appState.updateTransfer(item.transferId, status: TransferStatus.failed);
         return;
       }
     }
@@ -1190,8 +1442,12 @@ class _TransferPageState extends State<TransferPage> {
           await raf!.setPosition(i * kChunkSize);
           chunkBytes = await raf.read(len);
         } else {
-          chunkBytes = streamChunks[i];
-        }
+            // RAF is open from the temp file copy — read chunk from it
+            final len = ((i + 1) * kChunkSize > totalSize)
+                ? totalSize - (i * kChunkSize) : kChunkSize;
+            await raf!.setPosition(i * kChunkSize);
+            chunkBytes = await raf.read(len);
+          }
 
         if (item.status == TransferStatus.cancelled) return;
 
@@ -1201,11 +1457,11 @@ class _TransferPageState extends State<TransferPage> {
             'chunkIndex':  i.toString(),
             'totalChunks': totalChunks.toString(),
             'totalSize':   totalSize.toString(),
-            'filename':    item.file.name,
+            'filename':    fileName,
             'fromId':      appState.myId,
             'fromName':    appState.myName,
             'file': MultipartFile.fromBytes(
-              chunkBytes, filename: item.file.name),
+              chunkBytes, filename: fileName),
           });
 
           await dio.post(
@@ -1216,12 +1472,28 @@ class _TransferPageState extends State<TransferPage> {
 
           final now = DateTime.now().millisecondsSinceEpoch;
           if (now - lastSpeedTime >= 500) {
-            final bps = (sentBytes - lastSpeedBytes) /
-                ((now - lastSpeedTime) / 1000);
+            final elapsed = (now - lastSpeedTime) / 1000;
+            final bps     = (sentBytes - lastSpeedBytes) / elapsed;
             lastSpeedBytes = sentBytes;
             lastSpeedTime  = now;
+
+            // ETA calculation
+            final remaining = totalSize - sentBytes;
+            final etaSecs   = bps > 0 ? (remaining / bps).round() : 0;
+            String eta = '';
+            if (etaSecs > 0) {
+              if (etaSecs < 60) {
+                eta = '${etaSecs}s left';
+              } else if (etaSecs < 3600) {
+                eta = '${(etaSecs ~/ 60)}m ${etaSecs % 60}s left';
+              } else {
+                eta = '${(etaSecs ~/ 3600)}h ${(etaSecs % 3600) ~/ 60}m left';
+              }
+            }
+
             appState.updateTransfer(item.transferId,
-              speed: '${_fmtSize(bps.toInt())}/s');
+              speed: '${_fmtSize(bps.toInt())}/s',
+              eta:   eta);
           }
 
           appState.updateTransfer(item.transferId,
@@ -1239,11 +1511,11 @@ class _TransferPageState extends State<TransferPage> {
               'chunkIndex':  i.toString(),
               'totalChunks': totalChunks.toString(),
               'totalSize':   totalSize.toString(),
-              'filename':    item.file!.name,
+              'filename':    fileName,
               'fromId':      appState.myId,
               'fromName':    appState.myName,
               'file': MultipartFile.fromBytes(
-                chunkBytes, filename: item.file!.name),
+                chunkBytes, filename: fileName),
             });
             await dio.post('${appState.peerBaseUrl}/chunk', data: retryData);
             sentBytes         += chunkBytes.length;
@@ -1262,7 +1534,13 @@ class _TransferPageState extends State<TransferPage> {
         }
       }
     } finally {
+      dio.close(force: true);
       await raf?.close();
+      // Delete temp file if we created one for stream-based upload
+      if (item.tempPath != null) {
+        try { File(item.tempPath!).deleteSync(); } catch (_) {}
+        item.tempPath = null;
+      }
     }
 
     if (item.status != TransferStatus.cancelled) {
@@ -1272,10 +1550,9 @@ class _TransferPageState extends State<TransferPage> {
   }
 
   Future<void> _cancel(TransferItem item) async {
-    appState.updateTransfer(item.transferId,
-      status: TransferStatus.cancelled);
+    appState.updateTransfer(item.transferId, status: TransferStatus.cancelled);
     try {
-      await dio.post('${appState.peerBaseUrl}/transfer/cancel',
+      await Dio().post('${appState.peerBaseUrl}/transfer/cancel',
         data: {'transferId': item.transferId});
     } catch (_) {}
   }
@@ -1284,8 +1561,10 @@ class _TransferPageState extends State<TransferPage> {
     appState.updateTransfer(item.transferId,
       status:       TransferStatus.waiting,
       currentChunk: 0,
-      progress:     0);
-    if (!_isRunning) _runQueue();
+      progress:     0,
+      speed:        '',
+      eta:          '');
+    _runQueue(); // _runQueue checks _isRunning internally
   }
 
   // ── HELPERS ────────────────────────────────────────
@@ -1345,6 +1624,11 @@ class _TransferPageState extends State<TransferPage> {
       animation: appState,
       builder: (_, __) => Scaffold(
         appBar: AppBar(
+          // Explicit back button so desktop users can always go back
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back_rounded),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
           title: Text('Transfer · ${widget.targetName}'),
           actions: [
             Padding(
@@ -1468,36 +1752,69 @@ class _TransferPageState extends State<TransferPage> {
                                   Text(
                                     '${(item.progress * 100).toStringAsFixed(0)}%',
                                     style: TextStyle(fontSize: 11,
-                                      color: scheme.onSurface
-                                          .withOpacity(0.5))),
+                                      color: scheme.onSurface.withOpacity(0.5))),
                                   const Spacer(),
+                                  if (item.eta.isNotEmpty) ...[
+                                    Text(item.eta,
+                                      style: TextStyle(fontSize: 11,
+                                        color: scheme.primary.withOpacity(0.8))),
+                                    const SizedBox(width: 6),
+                                    Text('·', style: TextStyle(
+                                      color: scheme.onSurface.withOpacity(0.3),
+                                      fontSize: 11)),
+                                    const SizedBox(width: 6),
+                                  ],
                                   if (item.speed.isNotEmpty)
                                     Text(item.speed,
                                       style: TextStyle(fontSize: 11,
-                                        color: scheme.onSurface
-                                            .withOpacity(0.4))),
+                                        color: scheme.onSurface.withOpacity(0.4))),
                                 ]),
                               ],
 
+                              // Controls row
+                            Row(children: [
+                              // Retry for failed sends
+                              if (isSending && item.status == TransferStatus.failed)
+                                TextButton.icon(
+                                  onPressed: () => _retry(item),
+                                  icon: const Icon(Icons.refresh, size: 14),
+                                  label: const Text('Retry',
+                                    style: TextStyle(fontSize: 12))),
+                              // Open file location when done (sender sees source, receiver sees saved path)
+                              if (item.status == TransferStatus.done)
+                                TextButton.icon(
+                                  onPressed: () async {
+                                    // For received files, open the saved location
+                                    // For sent files, open the source file
+                                    final path = item.tempPath ?? (item.file?.path as String?);
+                                    if (path != null) {
+                                      final result = await OpenFilex.open(path);
+                                      if (result.type != ResultType.done && context.mounted) {
+                                        // Try opening the folder instead
+                                        final dir = p.dirname(path);
+                                        await OpenFilex.open(dir);
+                                      }
+                                    }
+                                  },
+                                  icon: Icon(Icons.folder_open_rounded,
+                                    size: 14, color: scheme.primary),
+                                  label: Text('Open location',
+                                    style: TextStyle(
+                                      fontSize: 12, color: scheme.primary)),
+                                ),
+                              const Spacer(),
+                              // Cancel for active/waiting sends
                               if (isSending &&
                                   item.status != TransferStatus.done &&
                                   item.status != TransferStatus.cancelled)
-                                Row(children: [
-                                  if (item.status == TransferStatus.failed)
-                                    TextButton.icon(
-                                      onPressed: () => _retry(item),
-                                      icon: const Icon(Icons.refresh, size: 14),
-                                      label: const Text('Retry',
-                                        style: TextStyle(fontSize: 12))),
-                                  const Spacer(),
-                                  TextButton.icon(
-                                    onPressed: () => _cancel(item),
-                                    icon: const Icon(Icons.close, size: 14,
-                                      color: Colors.red),
-                                    label: const Text('Cancel',
-                                      style: TextStyle(
-                                        color: Colors.red, fontSize: 12))),
-                                ]),
+                                TextButton.icon(
+                                  onPressed: () => _cancel(item),
+                                  icon: const Icon(Icons.close, size: 14,
+                                    color: Colors.red),
+                                  label: const Text('Cancel',
+                                    style: TextStyle(
+                                      color: Colors.red, fontSize: 12))),
+                            ]),
                             ],
                           ),
                         ),
@@ -1940,6 +2257,35 @@ class _HistoryPageState extends State<HistoryPage> {
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _fetch),
+          IconButton(
+            icon: const Icon(Icons.delete_sweep_rounded),
+            tooltip: 'Clear history',
+            onPressed: () async {
+              final confirm = await showDialog<bool>(
+                context: context,
+                builder: (_) => AlertDialog(
+                  title: const Text('Clear History'),
+                  content: const Text(
+                    'This removes all transfer history from this device. '
+                    'Files already saved are not affected.'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Cancel')),
+                    ElevatedButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red),
+                      child: const Text('Clear')),
+                  ],
+                ),
+              );
+              if (confirm == true) {
+                // Clear via server endpoint
+                await dio.delete('http://127.0.0.1:${appState.myPort}/history');
+                _fetch();
+              }
+            }),
         ],
       ),
       body: loading
@@ -2009,6 +2355,36 @@ class _HistoryPageState extends State<HistoryPage> {
                             Text(_fmtTime(ts),
                               style: TextStyle(fontSize: 11,
                                 color: scheme.onSurface.withOpacity(0.4))),
+                            const SizedBox(width: 4),
+                            // Delete this entry
+                            GestureDetector(
+                              onTap: () async {
+                                final confirm = await showDialog<bool>(
+                                  context: context,
+                                  builder: (_) => AlertDialog(
+                                    title: const Text('Delete Entry'),
+                                    content: const Text('Remove this transfer from history? The file itself is not deleted.'),
+                                    actions: [
+                                      TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+                                      ElevatedButton(
+                                        onPressed: () => Navigator.pop(context, true),
+                                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                                        child: const Text('Delete')),
+                                    ],
+                                  ),
+                                );
+                                if (confirm == true) {
+                                  final id = entry['id']?.toString() ?? entry['transferId']?.toString() ?? '';
+                                  if (id.isNotEmpty) {
+                                    await dio.delete('http://127.0.0.1:${appState.myPort}/history/$id');
+                                    _fetch();
+                                  }
+                                }
+                              },
+                              child: Icon(Icons.close_rounded,
+                                size: 16,
+                                color: scheme.onSurface.withOpacity(0.3)),
+                            ),
                           ]),
                           const SizedBox(height: 10),
                           Row(children: [
@@ -2066,7 +2442,7 @@ class _HistoryPageState extends State<HistoryPage> {
                                   Text(size, style: TextStyle(
                                     fontSize: 11,
                                     color: scheme.onSurface.withOpacity(0.4))),
-                                if (savedTo.isNotEmpty)
+                                if (savedTo.isNotEmpty) ...[
                                   IconButton(
                                     icon: Icon(Icons.open_in_new_rounded,
                                       size: 16,
@@ -2078,11 +2454,29 @@ class _HistoryPageState extends State<HistoryPage> {
                                       final result = await OpenFilex.open(savedTo);
                                       if (result.type != ResultType.done && context.mounted) {
                                         ScaffoldMessenger.of(context).showSnackBar(
-                                          SnackBar(content: Text(
-                                            'Cannot open: \${result.message}')));
+                                          SnackBar(content: Text('Cannot open: ${result.message}')));
                                       }
                                     },
                                   ),
+                                  IconButton(
+                                    icon: Icon(Icons.folder_open_rounded,
+                                      size: 16,
+                                      color: scheme.onSurface.withOpacity(0.4)),
+                                    tooltip: 'Open folder',
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(),
+                                    onPressed: () async {
+                                      final folder = p.dirname(savedTo);
+                                      final result = await OpenFilex.open(folder);
+                                      if (result.type != ResultType.done && context.mounted) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text('Location: $folder'),
+                                            duration: const Duration(seconds: 5)));
+                                      }
+                                    },
+                                  ),
+                                ],
                               ]),
                             );
                           }),
@@ -2095,6 +2489,265 @@ class _HistoryPageState extends State<HistoryPage> {
                     );
                   },
                 ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  ORBITAL BACKGROUND ANIMATION
+//  Pure Flutter — no packages. Draws an animated X with
+//  file type icons orbiting around it on elliptical paths.
+// ═══════════════════════════════════════════════════════
+
+class OrbitalBackground extends StatefulWidget {
+  const OrbitalBackground({super.key});
+  @override
+  State<OrbitalBackground> createState() => _OrbitalBackgroundState();
+}
+
+class _OrbitalBackgroundState extends State<OrbitalBackground>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 12),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = themeNotifier.isDark;
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (_, __) => CustomPaint(
+        painter: _OrbitalPainter(
+          progress: _ctrl.value,
+          isDark:   isDark,
+        ),
+      ),
+    );
+  }
+}
+
+// ── The actual painter ────────────────────────────────
+
+class _OrbitalPainter extends CustomPainter {
+  final double progress;
+  final bool   isDark;
+
+  _OrbitalPainter({required this.progress, required this.isDark});
+
+  // Orbit config: [angle offset, orbit scale X, orbit scale Y, speed multiplier]
+  static const _orbits = [
+    [0.0,   1.0,  0.38, 1.0],   // image   — outer ring, normal speed
+    [0.5,   1.0,  0.38, 1.0],   // video   — outer ring, opposite side
+    [0.25,  0.68, 0.28, 1.4],   // music   — inner ring, faster
+    [0.75,  0.68, 0.28, 1.4],   // doc     — inner ring, opposite
+  ];
+
+  // Icon emoji characters for each orbit
+  static const _emojis = ['🖼', '🎬', '🎵', '📄'];
+
+  // Orbit ring colors (ARGB)
+  static const _ringColors = [
+    Color(0xFF2979FF),  // blue
+    Color(0xFF9C27B0),  // purple
+    Color(0xFFE91E63),  // pink
+    Color(0xFFFF9800),  // orange
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width  / 2;
+
+    // Keep animation in the upper portion — don't cover device cards
+    final centerY = size.height * 0.18;
+    final radius  = size.width  * 0.28;
+
+    // ── Draw X ─────────────────────────────────────
+    _drawX(canvas, cx, centerY, radius * 0.55);
+
+    // ── Draw orbit rings ────────────────────────────
+    for (int i = 0; i < _orbits.length; i++) {
+      final cfg    = _orbits[i];
+      final rx     = radius * cfg[1];      // horizontal radius of ellipse
+      final ry     = radius * cfg[2] * 0.5; // vertical radius (flatten it)
+      final tilt   = i.isEven ? -0.25 : 0.25; // tilt angle in radians
+
+      _drawOrbitRing(canvas, cx, centerY, rx, ry, tilt, _ringColors[i]);
+    }
+
+    // ── Draw orbiting icons ─────────────────────────
+    for (int i = 0; i < _orbits.length; i++) {
+      final cfg      = _orbits[i];
+      final offset   = cfg[0];
+      final scaleX   = cfg[1];
+      final scaleY   = cfg[2];
+      final speed    = cfg[3];
+
+      final angle    = (progress * speed + offset) * 2 * math.pi;
+      final tilt     = i.isEven ? -0.25 : 0.25;
+
+      // Elliptical orbit with tilt
+      final rawX = math.cos(angle) * radius * scaleX;
+      final rawY = math.sin(angle) * radius * scaleY * 0.5;
+
+      // Apply tilt rotation
+      final x = cx + rawX * math.cos(tilt) - rawY * math.sin(tilt);
+      final y = centerY + rawX * math.sin(tilt) + rawY * math.cos(tilt);
+
+      // Depth cue: icons "behind" the X are smaller and more transparent
+      final depth    = (math.sin(angle) + 1) / 2; // 0 = far, 1 = near
+      final iconSize = 16.0 + depth * 10;
+      final alpha    = 0.4 + depth * 0.6;
+
+      _drawIconCircle(canvas, x, y, iconSize, _emojis[i],
+        _ringColors[i], alpha);
+    }
+  }
+
+  void _drawX(Canvas canvas, double cx, double cy, double size) {
+    final paint = Paint()
+      ..style       = PaintingStyle.stroke
+      ..strokeWidth = size * 0.18
+      ..strokeCap   = StrokeCap.round
+      ..color       = (isDark
+          ? const Color(0xFF2979FF)
+          : const Color(0xFF1565C0)).withOpacity(0.12);
+
+    // First stroke of X
+    canvas.drawLine(
+      Offset(cx - size, cy - size),
+      Offset(cx + size, cy + size),
+      paint,
+    );
+    // Second stroke of X
+    canvas.drawLine(
+      Offset(cx + size, cy - size),
+      Offset(cx - size, cy + size),
+      paint,
+    );
+  }
+
+  void _drawOrbitRing(Canvas canvas, double cx, double cy,
+      double rx, double ry, double tilt, Color color) {
+    final paint = Paint()
+      ..style       = PaintingStyle.stroke
+      ..strokeWidth = 0.8
+      ..color       = color.withOpacity(isDark ? 0.15 : 0.1);
+
+    // Draw ellipse as a path with tilt
+    final path = Path();
+    const steps = 80;
+    for (int j = 0; j <= steps; j++) {
+      final a    = (j / steps) * 2 * math.pi;
+      final rawX = math.cos(a) * rx;
+      final rawY = math.sin(a) * ry;
+      final x    = cx + rawX * math.cos(tilt) - rawY * math.sin(tilt);
+      final y    = cy + rawX * math.sin(tilt) + rawY * math.cos(tilt);
+      if (j == 0) path.moveTo(x, y); else path.lineTo(x, y);
+    }
+    path.close();
+    canvas.drawPath(path, paint);
+  }
+
+  void _drawIconCircle(Canvas canvas, double x, double y,
+      double size, String emoji, Color color, double alpha) {
+    // Circle background
+    final bgPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = color.withOpacity(alpha * (isDark ? 0.25 : 0.15));
+
+    canvas.drawCircle(Offset(x, y), size * 0.85, bgPaint);
+
+    // Circle border
+    final borderPaint = Paint()
+      ..style       = PaintingStyle.stroke
+      ..strokeWidth = 0.8
+      ..color       = color.withOpacity(alpha * 0.6);
+
+    canvas.drawCircle(Offset(x, y), size * 0.85, borderPaint);
+
+    // Emoji text
+    final tp = TextPainter(
+      text: TextSpan(
+        text: emoji,
+        style: TextStyle(fontSize: size * 0.8),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+
+    tp.paint(canvas, Offset(
+      x - tp.width  / 2,
+      y - tp.height / 2,
+    ));
+  }
+
+  @override
+  bool shouldRepaint(_OrbitalPainter old) =>
+      old.progress != progress || old.isDark != isDark;
+}
+
+// ── Loading screen (shown while server starts) ────────
+
+class OrbitalLoadingScreen extends StatefulWidget {
+  const OrbitalLoadingScreen({super.key});
+  @override
+  State<OrbitalLoadingScreen> createState() => _OrbitalLoadingScreenState();
+}
+
+class _OrbitalLoadingScreenState extends State<OrbitalLoadingScreen>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 10),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(
+          width: 160, height: 160,
+          child: AnimatedBuilder(
+            animation: _ctrl,
+            builder: (_, __) => CustomPaint(
+              painter: _OrbitalPainter(
+                progress: _ctrl.value,
+                isDark:   themeNotifier.isDark,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Text('Starting Xorbit...',
+          style: TextStyle(
+            fontSize: 14,
+            color: scheme.onSurface.withOpacity(0.5))),
+      ]),
     );
   }
 }

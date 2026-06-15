@@ -116,6 +116,9 @@ class AppState extends ChangeNotifier {
   // Set when remote device accepts our connection request
   String? acceptedByName;
 
+  // Files shared from other apps, waiting to be sent once connected
+  List<String> pendingSharedPaths = [];
+
   // ── Init ─────────────────────────────────────────
 
   Future<void> init() async {
@@ -148,18 +151,25 @@ class AppState extends ChangeNotifier {
   }
 
   void removeDevice(String id) {
-    nearbyDevices.remove(id);
-    if (connectedToId == id) disconnect();
-    notifyListeners();
+  nearbyDevices.remove(id);
+  // Never auto-disconnect a peer that has active transfers
+  if (connectedToId == id) {
+    final hasActiveTransfer = transfers.any((t) =>
+      t.direction == TransferDirection.sending &&
+      (t.status == TransferStatus.transferring ||
+       t.status == TransferStatus.waiting));
+    if (!hasActiveTransfer) disconnect();
   }
+  notifyListeners();
+}
 
-  void pruneOfflineDevices() {
-    final stale = nearbyDevices.entries
-        .where((e) => !e.value.isOnline)
-        .map((e) => e.key)
-        .toList();
-    for (final id in stale) removeDevice(id);
-  }
+void pruneOfflineDevices() {
+  final stale = nearbyDevices.entries
+      .where((e) => !e.value.isOnline && e.key != connectedToId)
+      .map((e) => e.key)
+      .toList();
+  for (final id in stale) removeDevice(id);
+}
 
   // ── Connection state ──────────────────────────────
 
@@ -169,6 +179,7 @@ class AppState extends ChangeNotifier {
     connectedToIp   = device.ip;
     connectedToPort = device.port;
     notifyListeners();
+    // pendingSharedPaths handled by DevicePage._onStateChanged
   }
 
   void disconnect() {
@@ -218,6 +229,7 @@ class AppState extends ChangeNotifier {
     TransferStatus? status,
     double? progress,
     String? speed,
+    String? eta,
     int? currentChunk,
   }) {
     final t = transfers.where((t) => t.transferId == transferId).firstOrNull;
@@ -225,6 +237,7 @@ class AppState extends ChangeNotifier {
     if (status       != null) t.status       = status;
     if (progress     != null) t.progress     = progress;
     if (speed        != null) t.speed        = speed;
+    if (eta          != null) t.eta          = eta;
     if (currentChunk != null) t.currentChunk = currentChunk;
     notifyListeners();
   }

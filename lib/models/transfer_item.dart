@@ -9,10 +9,14 @@ class TransferItem {
   TransferDirection direction;
   double progress;
   String speed;
+  String eta;
   int currentChunk;
 
   // Only non-null for sending items
   final dynamic file; // PlatformFile
+
+  // Temp file path used when file was uploaded via stream (no direct path)
+  String? tempPath;
 
   TransferItem.sending({
     required this.transferId,
@@ -23,6 +27,7 @@ class TransferItem {
         direction    = TransferDirection.sending,
         progress     = 0,
         speed        = '',
+        eta          = '',
         currentChunk = 0;
 
   TransferItem.receiving({
@@ -34,5 +39,6 @@ class TransferItem {
         direction   = TransferDirection.receiving,
         progress    = 0,
         speed       = '',
+        eta         = '',
         currentChunk = 0;
 }

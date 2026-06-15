@@ -1,6 +1,5 @@
 name: xorbit
 description: Fast. Local. Private. File transfer for everyone.
-display_name: Xorbit
 version: 1.0.0+1
 
 environment:
@@ -31,18 +30,12 @@ dependencies:
   path_provider: ^2.1.2
   open_filex: ^4.3.4  # open received files from within the app
 
-dev_dependencies:
-  flutter_launcher_icons: ^0.13.1
+  flutter_foreground_task: ^9.2.2
 
-flutter_launcher_icons:
-  android: true
-  ios: true
-  windows:
-    generate: true
-    image_path: "assets/icon/icon.png"
-    icon_size: 48
-  image_path: "assets/icon/icon.png"
-  min_sdk_android: 21
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
 
 flutter:
   uses-material-design: true
