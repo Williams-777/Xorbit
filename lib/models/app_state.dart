@@ -119,6 +119,9 @@ class AppState extends ChangeNotifier {
   // Files shared from other apps, waiting to be sent once connected
   List<String> pendingSharedPaths = [];
 
+
+  bool peerWentOffline = false;
+
   // ── Init ─────────────────────────────────────────
 
   Future<void> init() async {
@@ -143,33 +146,47 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  void pruneOfflineDevices() {
+    final stale = nearbyDevices.entries
+        .where((e) => !e.value.isOnline && e.key != connectedToId)
+        .map((e) => e.key)
+        .toList();
+    for (final id in stale) removeDevice(id);
+
+    // Check if connected peer has gone offline
+    if (connectedToId != null) {
+      final peer = nearbyDevices[connectedToId!];
+      if (peer == null || !peer.isOnline) {
+        peerWentOffline = true;
+        disconnect();
+        notifyListeners();
+      }
+    }
+  }
+
   // ── Device discovery updates ──────────────────────
 
   void upsertDevice(XorbitDevice device) {
-    nearbyDevices[device.id] = device;
-    notifyListeners();
+  final existing = nearbyDevices[device.id];
+  nearbyDevices[device.id] = device;
+    // Only notify if it's a genuinely new device or IP changed
+    if (existing == null || existing.ip != device.ip) {
+      notifyListeners();
+    }
   }
 
   void removeDevice(String id) {
-  nearbyDevices.remove(id);
-  // Never auto-disconnect a peer that has active transfers
-  if (connectedToId == id) {
-    final hasActiveTransfer = transfers.any((t) =>
-      t.direction == TransferDirection.sending &&
-      (t.status == TransferStatus.transferring ||
-       t.status == TransferStatus.waiting));
-    if (!hasActiveTransfer) disconnect();
+    nearbyDevices.remove(id);
+    // Never auto-disconnect a peer that has active transfers
+    if (connectedToId == id) {
+      final hasActiveTransfer = transfers.any((t) =>
+        t.direction == TransferDirection.sending &&
+        (t.status == TransferStatus.transferring ||
+         t.status == TransferStatus.waiting));
+      if (!hasActiveTransfer) disconnect();
+    }
+    notifyListeners();
   }
-  notifyListeners();
-}
-
-void pruneOfflineDevices() {
-  final stale = nearbyDevices.entries
-      .where((e) => !e.value.isOnline && e.key != connectedToId)
-      .map((e) => e.key)
-      .toList();
-  for (final id in stale) removeDevice(id);
-}
 
   // ── Connection state ──────────────────────────────
 
@@ -231,6 +248,7 @@ void pruneOfflineDevices() {
     String? speed,
     String? eta,
     int? currentChunk,
+    String? savedPath,
   }) {
     final t = transfers.where((t) => t.transferId == transferId).firstOrNull;
     if (t == null) return;
@@ -239,6 +257,16 @@ void pruneOfflineDevices() {
     if (speed        != null) t.speed        = speed;
     if (eta          != null) t.eta          = eta;
     if (currentChunk != null) t.currentChunk = currentChunk;
+    if (savedPath    != null) t.savedPath    = savedPath;  
     notifyListeners();
   }
 }
+
+// ─────────────────────────────────────────────────────
+//  GLOBALS
+// ─────────────────────────────────────────────────────
+const int kServerPort = 3000;
+const int kChunkSize  = 4 * 1024 * 1024; // 4 MB — balance between speed and reliability
+
+final AppState      appState      = AppState();
+final ThemeNotifier themeNotifier = ThemeNotifier();

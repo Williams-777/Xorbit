@@ -418,7 +418,10 @@ class EmbeddedServer {
       };
 
       state.updateTransfer(transferId,
-        status: TransferStatus.done, progress: 1.0);
+        status:    TransferStatus.done,
+        progress:  1.0,
+        savedPath: transfer['finalPath'] as String,
+      );
 
       // Notify Android MediaStore — makes file visible in Gallery/VLC
       _notifyMediaStore(transfer['finalPath'] as String);

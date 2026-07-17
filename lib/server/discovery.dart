@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
 import '../models/app_state.dart';
 
 const int kDiscoveryPort = 4210;
-const int kServerPort    = 3000;
 const String kDiscoveryMagic = 'XORBIT_DISCOVER_V1';
 
 /// Hybrid discovery — tries three methods in parallel:
